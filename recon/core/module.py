@@ -5,15 +5,14 @@ import hmac
 import HTMLParser
 import os
 import re
-import socket
+# import socket
 import sqlite3
-import struct
-# import sys
+# import struct
 import textwrap
 import time
-# import urllib
 import urlparse
-# framework libs
+import netaddr
+
 from recon.core import framework
 
 
@@ -22,91 +21,75 @@ from recon.core import framework
 # =================================================
 
 class BaseModule(framework.Framework):
+    """Base Module Framework"""
 
     def __init__(self, params, query=None):
-        framework.Framework.__init__(self, params)
         self.logger.debug('')
+        framework.Framework.__init__(self, params)
         self.options = framework.Options()
-        # register a data source option if a default query is specified in the module
+        self.module_path = os.path.join(self.app_path, 'modules', "%s.py" % self._modulename)
+
         if 'query' in self.meta:
             self._default_source = self.meta['query']
-            self.register_option('source', 'default', True, 'source of input (see \'show info\' for details)')
+            self.register_option(
+                'source',
+                'default', True,
+                'source of input (see \'show info\' for details)')
+
         # register all other specified options
         if 'options' in self.meta:
             for option in self.meta['options']:
                 self.register_option(*option)
+
         self._reload = 0
 
-    #==================================================
+    # ==================================================
     # SUPPORT METHODS
-    #==================================================
+    # ==================================================
 
     def ascii_sanitize(self, s):
-        return ''.join([char for char in s if ord(char) in [10,13] + range(32, 126)])
+        """get printable string"""
+        import string
 
-    def html_unescape(self, s):
-        '''Unescapes HTML markup and returns an unescaped string.'''
-        h = HTMLParser.HTMLParser()
-        return h.unescape(s)
-        #p = htmllib.HTMLParser(None)
-        #p.save_bgn()
-        #p.feed(s)
-        #return p.save_end()
+        return filter(lambda x: x in string.printable, s)
 
     def html_escape(self, s):
+        """escapes html markup"""
         escapes = {
             '&': '&amp;',
             '"': '&quot;',
             "'": '&apos;',
             '>': '&gt;',
-            '<': '&lt;',
+            '<': '&lt;'
             }
-        return ''.join(escapes.get(c,c) for c in s)
 
-    def cidr_to_list(self, string):
-        # references:
-        # http://boubakr92.wordpress.com/2012/12/20/convert-cidr-into-ip-range-with-python/
-        # http://stackoverflow.com/questions/8338655/how-to-get-list-of-ip-addresses
-        # parse address and cidr
-        (addrString, cidrString) = string.split('/')
-        # split address into octets and convert cidr to int
-        addr = addrString.split('.')
-        cidr = int(cidrString)
-        # initialize the netmask and calculate based on cidr mask
-        mask = [0, 0, 0, 0]
-        for i in range(cidr):
-            mask[i/8] = mask[i/8] + (1 << (7 - i % 8))
-        # initialize net and binary and netmask with addr to get network
-        net = []
-        for i in range(4):
-            net.append(int(addr[i]) & mask[i])
-        # duplicate net into broad array, gather host bits, and generate broadcast
-        broad = list(net)
-        brange = 32 - cidr
-        for i in range(brange):
-            broad[3 - i/8] = broad[3 - i/8] + (1 << (i % 8))
-        # print information, mapping integer lists to strings for easy printing
-        #mask = '.'.join(map(str, mask))
-        net = '.'.join(map(str, net))
-        broad = '.'.join(map(str, broad))
+        return ''.join(escapes.get(c, c) for c in s)
+
+    def html_unescape(self, s):
+        """unescapes HTML markup"""
+        return HTMLParser.HTMLParser().unescape(s)
+
+    def cidr_to_list(self, s):
+        """translate IP CIDR to IP LIST"""
         ips = []
-        f = struct.unpack('!I',socket.inet_pton(socket.AF_INET,net))[0]
-        l = struct.unpack('!I',socket.inet_pton(socket.AF_INET,broad))[0]
-        while f <= l:
-            ips.append(socket.inet_ntop(socket.AF_INET,struct.pack('!I',f)))
-            f = f + 1
+        try:
+            ips = [str(ip) for ip in netaddr.IPNetwork(s)]
+        except netaddr.AddrFormatError:
+            pass
+
         return ips
 
     def parse_name(self, name):
         elements = [self.html_unescape(x) for x in name.strip().split()]
         # remove prefixes and suffixes
         names = []
-        for i in range(0,len(elements)):
+        for i in range(0, len(elements)):
             # preserve initials
             if re.search(r'^\w\.$', elements[i]):
                 elements[i] = elements[i][:-1]
             # remove unecessary prefixes and suffixes
-            elif re.search(r'(?:\.|^the$|^jr$|^sr$|^I{2,3}$)', elements[i], re.IGNORECASE):
+            elif re.search(r'(?:\.|^the$|^jr$|^sr$|^I{2,3}$)',
+                           elements[i], re.IGNORECASE):
                 continue
             names.append(elements[i])
         # make sense of the remaining elements
@@ -124,36 +107,34 @@ class BaseModule(framework.Framework):
         domains = []
         for host in hosts:
             elements = host.split('.')
-            # recursively walk through the elements
-            # extracting all possible (sub)domains
             while len(elements) >= 2:
-                # account for domains stored as hosts
                 if len(elements) == 2:
                     domain = '.'.join(elements)
                 else:
-                    # drop the host element
+                    # domain = '.'.join(elements[-2:])
                     domain = '.'.join(elements[1:])
+
                 if domain not in domains + exclusions:
                     domains.append(domain)
                 del elements[0]
         return domains
 
-    #==================================================
+    # ==================================================
     # OPTIONS METHODS
-    #==================================================
+    # ==================================================
 
     def _get_source(self, params, query=None):
         prefix = params.split()[0].lower()
         if prefix in ['query', 'default']:
             query = ' '.join(params.split()[1:]) if prefix == 'query' else query
-            try: results = self.query(query)
+            try:
+                results = self.query(query)
             except sqlite3.OperationalError as e:
                 raise framework.FrameworkException('Invalid source query. %s %s' % (type(e).__name__, e.message))
             if not results:
                 sources = []
             elif len(results[0]) > 1:
                 sources = [x[:len(x)] for x in results]
-                #raise framework.FrameworkException('Too many columns of data as source input.')
             else:
                 sources = [x[0] for x in results]
         elif os.path.exists(params):
@@ -165,9 +146,9 @@ class BaseModule(framework.Framework):
             raise framework.FrameworkException('Source contains no input.')
         return source
 
-    #==================================================
+    # ==================================================
     # 3RD PARTY API METHODS
-    #==================================================
+    # ==================================================
 
     def get_explicit_oauth_token(self, resource, scope, authorize_url, access_url):
         token_name = resource+'_token'
@@ -182,7 +163,12 @@ class BaseModule(framework.Framework):
         client_secret = self.get_key(resource+'_secret')
         port = 31337
         redirect_uri = 'http://localhost:%d' % (port)
-        payload = {'response_type': 'code', 'client_id': client_id, 'scope': scope, 'state': self.get_random_str(40), 'redirect_uri': redirect_uri}
+        payload = {
+            'response_type': 'code',
+            'client_id': client_id,
+            'scope': scope,
+            'state': self.get_random_str(40),
+            'redirect_uri': redirect_uri}
         authorize_url = '%s?%s' % (authorize_url, urllib.urlencode(payload))
         w = webbrowser.get()
         w.open(authorize_url)
@@ -192,7 +178,13 @@ class BaseModule(framework.Framework):
         sock.listen(1)
         conn, addr = sock.accept()
         data = conn.recv(1024)
-        conn.sendall('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>Recon-ng</title></head><body>Response received. Return to Recon-ng.</body></html>')
+        conn.sendall(
+            'HTTP/1.1 200 OK\r\n'
+            'Content-Type: text/html\r\n\r\n'
+            '<html>'
+            '<head><title>Recon-ng</title></head>'
+            '<body>Response received. Return to Recon-ng.</body>'
+            '</html>')
         conn.close()
         # process the received data
         if 'error_description' in data:
@@ -240,7 +232,7 @@ class BaseModule(framework.Framework):
         headers = {'Authorization': 'Bearer %s' % (self.get_twitter_oauth_token())}
         url = 'https://api.twitter.com/1.1/search/tweets.json'
         # count causes inconsistent results when applied
-        #payload['count'] = 50 # api stops paginating at count=90
+        # payload['count'] = 50 # api stops paginating at count=90
         results = []
         while True:
             resp = self.request(url, payload=payload, headers=headers)
@@ -266,7 +258,7 @@ class BaseModule(framework.Framework):
         self.verbose('Searching Shodan API for: %s' % (query))
         while True:
             resp = self.request(url, payload=payload)
-            if resp.json == None:
+            if resp.json is None:
                 raise framework.FrameworkException('Invalid JSON response.\n%s' % (resp.text))
             if 'error' in resp.json:
                 raise framework.FrameworkException(resp.json['error'])
@@ -293,7 +285,7 @@ class BaseModule(framework.Framework):
         while True:
             resp = None
             resp = self.request(url, payload=payload, auth=(api_key, api_key))
-            if resp.json == None:
+            if resp.json is None:
                 raise framework.FrameworkException('Invalid JSON response.\n%s' % (resp.text))
             # add new results
             if 'results' in resp.json['d']:
@@ -303,7 +295,7 @@ class BaseModule(framework.Framework):
                 break
             cnt += 1
             # check for more pages
-            if not '__next' in resp.json['d']:
+            if '__next' not in resp.json['d']:
                 break
             payload['$skip'] = resp.json['d']['__next'].split('=')[-1]
         return results
@@ -319,7 +311,7 @@ class BaseModule(framework.Framework):
         while True:
             resp = None
             resp = self.request(url, payload=payload)
-            if resp.json == None:
+            if resp.json is None:
                 raise framework.FrameworkException('Invalid JSON response.\n%s' % (resp.text))
             # add new results
             if 'items' in resp.json:
@@ -329,7 +321,7 @@ class BaseModule(framework.Framework):
                 break
             cnt += 1
             # check for more pages
-            if not 'nextPage' in resp.json['queries']:
+            if 'nextPage' not in resp.json['queries']:
                 break
             payload['start'] = resp.json['queries']['nextPage'][0]['startIndex']
         return results
@@ -346,7 +338,7 @@ class BaseModule(framework.Framework):
         page = 1
         while True:
             # Github rate limit is 30 requests per minute
-            time.sleep(2) # 60s / 30r = 2s/r
+            time.sleep(2)  # 60s / 30r = 2s/r
             payload['page'] = page
             resp = self.request(url=url, headers=headers, payload=payload)
             # check for errors
@@ -370,9 +362,9 @@ class BaseModule(framework.Framework):
             break
         return results
 
-    #==================================================
+    # ==================================================
     # REQUEST METHODS
-    #==================================================
+    # ==================================================
 
     def make_cookie(self, name, value, domain, path='/'):
         return cookielib.Cookie(
@@ -394,9 +386,9 @@ class BaseModule(framework.Framework):
             rest=None
         )
 
-    #==================================================
+    # ==================================================
     # SHOW METHODS
-    #==================================================
+    # ==================================================
 
     def show_inputs(self):
         if hasattr(self, '_default_source'):
@@ -458,9 +450,18 @@ class BaseModule(framework.Framework):
     def show_globals(self):
         self.show_options(self._global_options)
 
-    #==================================================
+    # ==================================================
     # COMMAND METHODS
-    #==================================================
+    # ==================================================
+    def edit_file(self, filename):
+        '''get default text editor'''
+        editor = os.getenv('EDITOR', 'vim')
+        os.system('%s %s' % (editor, filename))
+
+    def do_edit(self, params):
+        '''Edit current module'''
+        self.output("EDIT => %s" % self.module_path)
+        self.edit_file(self.module_path)
 
     def do_reload(self, params):
         '''Reloads the current module'''
