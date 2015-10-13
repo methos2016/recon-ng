@@ -25,6 +25,8 @@ def handle_request_exception(self, func, *args, **kwargs):
         return func(*args, **kwargs)
     except urllib2.URLError:
         return None
+    except ssl.SSLError:
+        return None
 
 
 class Request(object):
